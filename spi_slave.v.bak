@@ -1,0 +1,153 @@
+/*******************************************************************************
+ * spi_slave.v
+ *
+ * SPI Mode 0 (CPOL=0, CPHA=0), MSB first, 8-bit
+ * 帧长 66 字节: 接收 STM32 发来的控制帧, 同步回传 64 字节调制数据
+ *
+ * 同步策略:
+ *   - SCK/MOSI/NSS 均在 CLK_IN (50 MHz) 双沿打两拍同步
+ *   - 用 SCK 上升沿采样 MOSI, 下降沿移出 MISO
+ *******************************************************************************/
+
+module spi_slave (
+    input  wire       clk,
+    // SPI 接口
+    input  wire       spi_sck,
+    input  wire       spi_nss,
+    input  wire       spi_mosi,
+    output reg        spi_miso,
+    // 解析结果
+    output reg  [1:0] mod_idx,
+    output reg  [7:0] snr_byte,
+    output reg        frame_valid,
+    // 回传 FIFO 接口
+    input  wire [7:0] tx_byte,
+    output reg        tx_rd,
+    input  wire       fifo_empty
+);
+
+    // -------------------------------------------------------
+    // 输入同步 (两级寄存器消除亚稳态)
+    // -------------------------------------------------------
+    reg [2:0] sck_r;
+    reg [1:0] nss_r, mosi_r;
+
+    always @(posedge clk) begin
+        sck_r  <= {sck_r[1:0],  spi_sck};
+        nss_r  <= {nss_r[0],    spi_nss};
+        mosi_r <= {mosi_r[0],   spi_mosi};
+    end
+
+    wire sck_rise  = (sck_r[2:1] == 2'b01);  // 上升沿: 采样 MOSI
+    wire sck_fall  = (sck_r[2:1] == 2'b10);  // 下降沿: 切换 MISO
+    wire nss_lo    = ~nss_r[1];               // 片选有效
+    wire mosi_bit  = mosi_r[1];
+
+    // -------------------------------------------------------
+    // 位计数 & 字节计数
+    // -------------------------------------------------------
+    reg [2:0] bit_cnt;    // 0~7, MSB first
+    reg [6:0] byte_cnt;   // 0~65 (66 bytes/frame)
+
+    // -------------------------------------------------------
+    // 接收移位寄存器
+    // -------------------------------------------------------
+    reg [7:0] rx_shift;
+    reg [7:0] rx_byte_r;
+    reg       rx_byte_valid;
+
+    // -------------------------------------------------------
+    // 发送移位寄存器 & 帧头
+    // -------------------------------------------------------
+    reg [7:0] tx_shift;
+    reg       tx_loaded;   // 当前字节已加载
+
+    // -------------------------------------------------------
+    // 主状态机
+    // -------------------------------------------------------
+    always @(posedge clk) begin
+        frame_valid    <= 1'b0;
+        rx_byte_valid  <= 1'b0;
+        tx_rd          <= 1'b0;
+
+        if (!nss_lo) begin
+            // NSS 无效: 复位
+            bit_cnt    <= 3'd7;   // 下次从 MSB 开始
+            byte_cnt   <= 7'd0;
+            tx_loaded  <= 1'b0;
+            spi_miso   <= 1'b0;
+        end else begin
+            // ------------------------------------------------
+            // SCK 下降沿: 预加载 MISO (给 STM32 采样时间)
+            // ------------------------------------------------
+            if (sck_fall) begin
+                if (!tx_loaded) begin
+                    // 根据字节位置决定回传内容
+                    case (byte_cnt)
+                        7'd0: tx_shift <= 8'h5A;          // 帧头
+                        7'd1: tx_shift <= 8'h00;          // 保留
+                        default: begin
+                            if (!fifo_empty) begin
+                                tx_shift <= tx_byte;
+                                tx_rd    <= 1'b1;         // 弹出 FIFO
+                            end else begin
+                                tx_shift <= 8'h80;        // FIFO 空: 补中值
+                            end
+                        end
+                    endcase
+                    tx_loaded <= 1'b1;
+                end
+                spi_miso  <= tx_shift[7];                 // 输出 MSB
+                tx_shift  <= {tx_shift[6:0], 1'b0};       // 左移
+            end
+
+            // ------------------------------------------------
+            // SCK 上升沿: 采样 MOSI
+            // ------------------------------------------------
+            if (sck_rise) begin
+                rx_shift <= {rx_shift[6:0], mosi_bit};    // 左移移入
+
+                if (bit_cnt == 3'd0) begin
+                    // 一个字节收完
+                    rx_byte_r     <= {rx_shift[6:0], mosi_bit};
+                    rx_byte_valid <= 1'b1;
+                    bit_cnt       <= 3'd7;
+                    tx_loaded     <= 1'b0;                // 下字节重新加载
+
+                    if (byte_cnt == 7'd65)
+                        byte_cnt <= 7'd0;
+                    else
+                        byte_cnt <= byte_cnt + 7'd1;
+                end else begin
+                    bit_cnt <= bit_cnt - 3'd1;
+                end
+            end
+        end
+    end
+
+    // -------------------------------------------------------
+    // 解析字节
+    // -------------------------------------------------------
+    always @(posedge clk) begin
+        if (rx_byte_valid) begin
+            case (byte_cnt)
+                7'd1: begin   // byte_cnt 已在上升沿更新, 此时指向刚收到的字节索引
+                    if (rx_byte_r == 8'hA5) begin
+                        // 帧头确认 (byte 0 → byte_cnt 变成 1)
+                    end
+                end
+                7'd2: begin   // byte[1] = mod_idx
+                    if (rx_byte_r <= 8'd2)
+                        mod_idx <= rx_byte_r[1:0];
+                end
+                7'd3: begin   // byte[2] = snr_byte
+                    snr_byte <= rx_byte_r;
+                end
+                7'd0: begin   // byte_cnt 回到 0 表示刚收完第 65 字节 (帧尾)
+                    frame_valid <= 1'b1;
+                end
+            endcase
+        end
+    end
+
+endmodule

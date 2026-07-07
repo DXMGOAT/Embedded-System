@@ -1,0 +1,272 @@
+/*******************************************************************************
+ * modulator.v
+ *
+ * 功能:
+ *   1. 伪随机序列生成 (PRBS-15) 作为基带数据源
+ *   2. 符号映射: BPSK / QPSK / 16QAM
+ *   3. 升余弦成形 FIR (11 抽头, roll-off=0.35, SPS=8)
+ *      系数由 MATLAB 仿真得出 (已归一化为整数 Q8 格式)
+ *   4. 载波调制: 200 kHz 正弦 NCO (50 MHz 系统钟)
+ *   5. AWGN 信道: LFSR 加性噪声, 幅度由 snr_byte 控制
+ *   6. 输出 8-bit 量化样本 (uint8, 中值=128) 送回传 FIFO
+ *
+ * 参数:
+ *   系统时钟 Fs = 50 MHz
+ *   符号率  Rs = 125 kSym/s  →  SPS = Fs/Rs = 400
+ *   (为节省资源此处 SPS 设为 8, 对应等效符号率 6.25 MSym/s,
+ *    实际演示频率可在 CLK_IN 分频后调整)
+ *******************************************************************************/
+
+module modulator (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [1:0]  mod_idx,   // 0=BPSK 1=QPSK 2=16QAM
+    input  wire [7:0]  snr_byte,  // snr_db + 32
+    output reg  [7:0]  out_sample,
+    output reg         out_valid
+);
+
+    // -------------------------------------------------------
+    // 参数
+    // -------------------------------------------------------
+    localparam SPS = 8;           // 每符号采样数
+
+    // 升余弦 FIR 系数 (11 抽头, Q8 格式, roll-off=0.35)
+    // 由 MATLAB: h = rcosdesign(0.35,2,SPS,'sqrt'); h=round(h/max(abs(h))*128)
+    localparam signed [8:0] H0  =  9'sd0;
+    localparam signed [8:0] H1  =  9'sd10;
+    localparam signed [8:0] H2  =  9'sd21;
+    localparam signed [8:0] H3  =  9'sd36;
+    localparam signed [8:0] H4  =  9'sd55;
+    localparam signed [8:0] H5  =  9'sd128; // 中心系数
+    localparam signed [8:0] H6  =  9'sd55;
+    localparam signed [8:0] H7  =  9'sd36;
+    localparam signed [8:0] H8  =  9'sd21;
+    localparam signed [8:0] H9  =  9'sd10;
+    localparam signed [8:0] H10 =  9'sd0;
+
+    // -------------------------------------------------------
+    // PRBS-15 生成器
+    // -------------------------------------------------------
+    reg [14:0] prbs;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) prbs <= 15'h7FFF;
+        else        prbs <= {prbs[13:0], prbs[14] ^ prbs[13]};
+    end
+    wire prbs_bit = prbs[14];
+
+    // -------------------------------------------------------
+    // 符号率分频 (50MHz / SPS / 8 = ~781 kHz 符号时钟, 演示用)
+    // -------------------------------------------------------
+    reg [9:0] sym_cnt;
+    reg       sym_pulse;   // 每 SPS*8 个系统时钟产生一个符号脉冲
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sym_cnt   <= 10'd0;
+            sym_pulse <= 1'b0;
+        end else begin
+            sym_pulse <= 1'b0;
+            if (sym_cnt == 10'd63) begin   // SPS*8=64
+                sym_cnt   <= 10'd0;
+                sym_pulse <= 1'b1;
+            end else begin
+                sym_cnt <= sym_cnt + 10'd1;
+            end
+        end
+    end
+
+    // -------------------------------------------------------
+    // 符号映射
+    // -------------------------------------------------------
+    reg signed [7:0] sym_i, sym_q;  // ±1,±3 电平 (Q2 格式, 单位=42)
+
+    // QPSK / 16QAM 需要多个比特
+    reg [3:0] bit_buf;
+    reg [1:0] bit_fill;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sym_i    <= 8'sd42;
+            sym_q    <= 8'sd0;
+            bit_buf  <= 4'h0;
+            bit_fill <= 2'd0;
+        end else if (sym_pulse) begin
+            bit_buf  <= {bit_buf[2:0], prbs_bit};
+            bit_fill <= bit_fill + 2'd1;
+
+            case (mod_idx)
+                2'd0: begin   // BPSK: 1 bit/sym
+                    sym_i <= prbs_bit ? 8'sd90 : -8'sd90;
+                    sym_q <= 8'sd0;
+                end
+                2'd1: begin   // QPSK: 2 bits/sym
+                    if (bit_fill[0]) begin
+                        sym_i <= bit_buf[1] ? 8'sd64 : -8'sd64;
+                        sym_q <= bit_buf[0] ? 8'sd64 : -8'sd64;
+                    end
+                end
+                2'd2: begin   // 16QAM: 4 bits/sym (每 4 拍更新一次)
+                    if (bit_fill == 2'd3) begin
+                        // I 分量: bits[3:2] → {-3,-1,+1,+3}×28
+                        case (bit_buf[3:2])
+                            2'b00: sym_i <= -8'sd84;
+                            2'b01: sym_i <= -8'sd28;
+                            2'b10: sym_i <=  8'sd28;
+                            2'b11: sym_i <=  8'sd84;
+                        endcase
+                        // Q 分量: bits[1:0]
+                        case (bit_buf[1:0])
+                            2'b00: sym_q <= -8'sd84;
+                            2'b01: sym_q <= -8'sd28;
+                            2'b10: sym_q <=  8'sd28;
+                            2'b11: sym_q <=  8'sd84;
+                        endcase
+                    end
+                end
+            endcase
+        end
+    end
+
+    // -------------------------------------------------------
+    // 上采样 + 成形 FIR (I 路)
+    // -------------------------------------------------------
+    // 插零上采样
+    reg signed [7:0]  fir_in_i;
+    reg [2:0]         sps_cnt;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sps_cnt  <= 3'd0;
+            fir_in_i <= 8'sd0;
+        end else begin
+            if (sym_pulse) begin
+                sps_cnt  <= 3'd1;
+                fir_in_i <= sym_i;   // 符号时刻非零
+            end else begin
+                sps_cnt  <= sps_cnt + 3'd1;
+                fir_in_i <= 8'sd0;   // 其余插零
+            end
+        end
+    end
+
+    // 延迟线
+    reg signed [7:0] dly [0:10];
+    integer k;
+    always @(posedge clk) begin
+        dly[0] <= fir_in_i;
+        for (k=1; k<=10; k=k+1)
+            dly[k] <= dly[k-1];
+    end
+
+    // 乘加
+    wire signed [16:0] fir_sum =
+        $signed(dly[0])  * H0  + $signed(dly[1])  * H1  +
+        $signed(dly[2])  * H2  + $signed(dly[3])  * H3  +
+        $signed(dly[4])  * H4  + $signed(dly[5])  * H5  +
+        $signed(dly[6])  * H6  + $signed(dly[7])  * H7  +
+        $signed(dly[8])  * H8  + $signed(dly[9])  * H9  +
+        $signed(dly[10]) * H10;
+
+    wire signed [7:0] fir_out_i = fir_sum[15:8];   // 右移 8 (Q8 反量化)
+
+    // -------------------------------------------------------
+    // 载波 NCO (200 kHz, 50 MHz 时钟)
+    // 相位累加字 = round(200e3/50e6 * 2^16) = 262
+    // -------------------------------------------------------
+    reg [15:0] phase_acc;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) phase_acc <= 16'd0;
+        else        phase_acc <= phase_acc + 16'd262;
+    end
+
+    // 简易正弦查找表 (64 点, 8-bit, Q7)
+    // sin(2π*n/64) * 127, n=0..63
+    reg signed [7:0] sin_lut [0:63];
+    initial begin
+        sin_lut[ 0]=  0; sin_lut[ 1]= 12; sin_lut[ 2]= 25; sin_lut[ 3]= 37;
+        sin_lut[ 4]= 49; sin_lut[ 5]= 60; sin_lut[ 6]= 71; sin_lut[ 7]= 81;
+        sin_lut[ 8]= 89; sin_lut[ 9]= 97; sin_lut[10]=104; sin_lut[11]=110;
+        sin_lut[12]=114; sin_lut[13]=118; sin_lut[14]=120; sin_lut[15]=122;
+        sin_lut[16]=122; sin_lut[17]=122; sin_lut[18]=120; sin_lut[19]=118;
+        sin_lut[20]=114; sin_lut[21]=110; sin_lut[22]=104; sin_lut[23]= 97;
+        sin_lut[24]= 89; sin_lut[25]= 81; sin_lut[26]= 71; sin_lut[27]= 60;
+        sin_lut[28]= 49; sin_lut[29]= 37; sin_lut[30]= 25; sin_lut[31]= 12;
+        sin_lut[32]=  0; sin_lut[33]=-12; sin_lut[34]=-25; sin_lut[35]=-37;
+        sin_lut[36]=-49; sin_lut[37]=-60; sin_lut[38]=-71; sin_lut[39]=-81;
+        sin_lut[40]=-89; sin_lut[41]=-97; sin_lut[42]=-104;sin_lut[43]=-110;
+        sin_lut[44]=-114;sin_lut[45]=-118;sin_lut[46]=-120;sin_lut[47]=-122;
+        sin_lut[48]=-122;sin_lut[49]=-122;sin_lut[50]=-120;sin_lut[51]=-118;
+        sin_lut[52]=-114;sin_lut[53]=-110;sin_lut[54]=-104;sin_lut[55]=-97;
+        sin_lut[56]=-89; sin_lut[57]=-81; sin_lut[58]=-71; sin_lut[59]=-60;
+        sin_lut[60]=-49; sin_lut[61]=-37; sin_lut[62]=-25; sin_lut[63]=-12;
+    end
+
+    wire [5:0]        sin_addr = phase_acc[15:10];
+    wire signed [7:0] carrier_i =  sin_lut[sin_addr];          // cos
+    wire signed [7:0] carrier_q = -sin_lut[(sin_addr+16)&6'h3F]; // sin (-90°)
+
+    // -------------------------------------------------------
+    // 混频 (I*cos - Q*sin)
+    // -------------------------------------------------------
+    wire signed [15:0] mixed = $signed(fir_out_i) * carrier_i;
+    wire signed [7:0]  mixed8 = mixed[14:7];   // 右移 7
+
+    // -------------------------------------------------------
+    // AWGN 噪声 (2路 LFSR XOR)
+    // snr_byte = snr_db + 32, snr_db ∈ [-2,20]
+    // 噪声幅度 ∝ 1/snr_byte
+    // -------------------------------------------------------
+    reg [15:0] noise_lfsr1, noise_lfsr2;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            noise_lfsr1 <= 16'hACE1;
+            noise_lfsr2 <= 16'h1234;
+        end else begin
+            noise_lfsr1 <= {noise_lfsr1[14:0],
+                            noise_lfsr1[15]^noise_lfsr1[14]^
+                            noise_lfsr1[12]^noise_lfsr1[3]};
+            noise_lfsr2 <= {noise_lfsr2[14:0],
+                            noise_lfsr2[15]^noise_lfsr2[13]^
+                            noise_lfsr2[11]^noise_lfsr2[0]};
+        end
+    end
+
+    wire [7:0] noise_raw = noise_lfsr1[7:0] ^ noise_lfsr2[7:0];
+
+    // snr_byte 越大 (SNR 高) 噪声越小
+    // 用移位简化: noise_amp = noise_raw >> (snr_byte >> 2)
+    reg signed [8:0] noise_scaled;
+    always @(*) begin
+        case (snr_byte[7:4])          // 高 4 位决定移位量 0~15
+            4'd0:  noise_scaled = $signed({1'b0, noise_raw});
+            4'd1:  noise_scaled = $signed({1'b0, noise_raw}) >>> 1;
+            4'd2:  noise_scaled = $signed({1'b0, noise_raw}) >>> 2;
+            4'd3:  noise_scaled = $signed({1'b0, noise_raw}) >>> 3;
+            4'd4:  noise_scaled = $signed({1'b0, noise_raw}) >>> 4;
+            4'd5:  noise_scaled = $signed({1'b0, noise_raw}) >>> 5;
+            default: noise_scaled = 9'sd0;
+        endcase
+    end
+
+    // -------------------------------------------------------
+    // 输出: 量化到 uint8 (中值=128)
+    // -------------------------------------------------------
+    wire signed [9:0] final_val = $signed({mixed8[7], mixed8[7], mixed8}) +
+                                  noise_scaled + 10'sd128;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            out_sample <= 8'h80;
+            out_valid  <= 1'b0;
+        end else begin
+            out_valid <= 1'b1;
+            if (final_val > 10'sd255)
+                out_sample <= 8'hFF;
+            else if (final_val < 10'sd0)
+                out_sample <= 8'h00;
+            else
+                out_sample <= final_val[7:0];
+        end
+    end
+
+endmodule

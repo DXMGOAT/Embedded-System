@@ -1,0 +1,12 @@
+# Quartus II generated files
+db/
+incremental_db/
+output_files/
+
+# Quartus II backup files
+*.qdf
+*.qarlog
+*.qws.rms
+
+# Simulation files
+simulation/
